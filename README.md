@@ -168,6 +168,13 @@ The parser is hardened against malformed and hostile inputs (bounds-checked head
 allocation caps, cycle guards on kernel data-structure walks) — but a dump from a
 compromised host is still untrusted data, so treat unknown images accordingly.
 
+## Authors
+
+Built by two friends who wanted MemProcFS-style memory forensics on Linux:
+
+- **Youssef Ayman** — [@ELJoOker2004](https://github.com/ELJoOker2004)
+- **Tarek Salama** — [@Immortal-ibr](https://github.com/Immortal-ibr)
+
 ## Acknowledgements
 
 An independent project inspired by, and interoperable with,
