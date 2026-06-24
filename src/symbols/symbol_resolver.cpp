@@ -7,6 +7,7 @@
 #include "os/linux/btf_probe.h"
 #include "core/error.h"
 #include "core/log.h"
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -57,6 +58,26 @@ std::size_t isf_symbol_count(const fs::path& p) {
     } catch (...) {
         return 0;
     }
+}
+
+bool release_is_below_support_floor(const std::string& release) {
+    auto parse_part = [](const std::string& s, std::size_t& pos, int& out) -> bool {
+        if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos]))) return false;
+        int v = 0;
+        while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
+            v = v * 10 + (s[pos] - '0');
+            ++pos;
+        }
+        out = v;
+        return true;
+    };
+    std::size_t pos = 0;
+    int major = 0, minor = 0;
+    if (!parse_part(release, pos, major)) return false;
+    if (pos >= release.size() || release[pos] != '.') return false;
+    ++pos;
+    if (!parse_part(release, pos, minor)) return false;
+    return major < 4 || (major == 4 && minor < 18);
 }
 
 // Standard cache locations to look for ISFs, in priority order. `preferred`
@@ -268,6 +289,25 @@ SymbolResolveResult resolve_symbols(const PhysicalLayer&        phys,
     auto distro  = linux::parse_distro(banner);
     if (release.empty())
         throw_error("Banner found but unparseable: '{}'", banner.substr(0, 200));
+    if (release_is_below_support_floor(release)) {
+        // Below the 4.18 best-effort floor. The auto path bails cleanly rather
+        // than emit bogus partial output. But if the user explicitly supplied
+        // symbols for this kernel (--symbols / --vmlinux), honor it as a
+        // power-user override and continue best-effort — the rbtree VMA path
+        // does handle the 4.x era — with a clear warning.
+        if (opts.user_path.empty() && opts.vmlinux_path.empty()) {
+            throw_error(
+                "Unsupported kernel release '{}' is below MemNixFS's current "
+                "compatibility floor (4.18+ best effort). Older kernels use "
+                "task/VMA/search layouts that may not be fully handled. Re-run "
+                "with --symbols <isf> or --vmlinux <path> to force best-effort "
+                "analysis, or use kallsyms triage.",
+                release);
+        }
+        log::warn("Kernel release '{}' is below the 4.18 best-effort floor; "
+                  "continuing because explicit symbols were provided. Output "
+                  "may be incomplete.", release);
+    }
     log::note("Detected kernel release: {} (distro={}, banner shown above)", release, distro);
 
     // Directory where any downloaded / generated ISF is saved (and which is

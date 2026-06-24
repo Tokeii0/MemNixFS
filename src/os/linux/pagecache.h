@@ -64,8 +64,12 @@ struct RecoveredFileStats {
     u64 pages_copied = 0;
     u64 pages_dropped = 0;
     u64 bytes_copied = 0;
+    u64 bytes_nonzero = 0;
     u64 missing_ranges_total = 0;
     u64 dropped_ranges_total = 0;
+    u64 vmemmap_base = 0;
+    u64 vmemmap_symbol_base = 0;
+    u64 vmemmap_derived_base = 0;
     bool physical_reads_checked = false;
     bool missing_ranges_truncated = false;
     bool dropped_ranges_truncated = false;

@@ -14,7 +14,10 @@
 #include "os/linux/yara_search.h"
 #include "core/log.h"
 #include <fmt/format.h>
+#include <algorithm>
 #include <cstring>
+#include <unordered_map>
+#include <vector>
 
 namespace lmpfs {
 
@@ -149,6 +152,10 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
         auto by_ino_dir = std::make_shared<vfs::DirNode>("by-ino");
         auto inodes     = linux::enumerate_cached_inodes(*eng);
 
+        // Overlayfs and bind mounts can expose several inodes at the same
+        // global path. Regular files are collected and resolved per path below,
+        // using exact recovery stats so /fs surfaces the inode with readable
+        // bytes instead of the first duplicate encountered.
         // File-CONTENT recovery turns cached folios into bytes, which needs
         // `vmemmap_base` to map a struct-page address to a physical frame.
         // When the ISF has no such symbol (BTF/types-only mode) we derive it
@@ -305,14 +312,18 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
             }
             return path;
         };
-        auto unavailable_file_bytes = [](const linux::CachedInode& ci) -> ByteBuf {
+        auto unavailable_file_bytes = [](const linux::CachedInode& ci,
+                                         const linux::RecoveredFileStats* st) -> ByteBuf {
             std::string body = fmt::format(
-                "unavailable: inode metadata was recovered for this file, but no cached content pages were recovered.\n"
+                "unavailable: inode metadata was recovered for this file, but no readable cached content bytes were recovered.\n"
                 "path: {}\n"
                 "filesystem: {}\n"
                 "inode: {}\n"
                 "logical_size: {} bytes\n"
                 "cached_pages: {}\n"
+                "copied_pages: {}\n"
+                "dropped_pages: {}\n"
+                "nonzero_bytes: {}\n"
                 "\n"
                 "The original file bytes are not present in the memory dump page cache. "
                 "MemNixFS is not returning synthetic zero-filled bytes for this file because that would be misleading. "
@@ -321,9 +332,63 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
                 ci.sb_fs.empty() ? "?" : ci.sb_fs,
                 ci.i_ino,
                 ci.i_size,
-                ci.nr_cached);
+                ci.nr_cached,
+                st ? st->pages_copied : 0,
+                st ? st->pages_dropped : 0,
+                st ? st->bytes_nonzero : 0);
             return ByteBuf(body.begin(), body.end());
         };
+        auto recovered_file_bytes = [unavailable_file_bytes](Engine* engp,
+                                                             const linux::CachedInode& ci) -> ByteBuf {
+            if (ci.i_size > 0 && ci.nr_cached == 0)
+                return unavailable_file_bytes(ci, nullptr);
+            auto rf = linux::recover_file_with_stats(*engp, ci);
+            if (ci.i_size > 0 && rf.stats.pages_copied == 0)
+                return unavailable_file_bytes(ci, &rf.stats);
+            return std::move(rf.bytes);
+        };
+
+        struct RegularCandidate {
+            linux::CachedInode ci;
+            std::string dirname;
+            std::string basename;
+        };
+        struct RegularScore {
+            u64 pages_copied = 0;
+            u64 bytes_nonzero = 0;
+            u64 bytes_copied = 0;
+            u64 pages_dropped = 0;
+            u64 nr_cached = 0;
+            bool sane_size = false;
+            bool non_pseudo = false;
+        };
+        auto score_regular = [&](const linux::CachedInode& ci) {
+            RegularScore s;
+            s.nr_cached = ci.nr_cached;
+            s.sane_size = ci.i_size > 0 && ci.i_size <= (4ULL * 1024 * 1024 * 1024);
+            s.non_pseudo = expose_in_fs_tree(ci);
+            if (ci.i_size > 0 && ci.nr_cached > 0) {
+                auto st = linux::recover_file_stats(*eng, ci, true);
+                s.pages_copied = st.pages_copied;
+                s.bytes_nonzero = st.bytes_nonzero;
+                s.bytes_copied = st.bytes_copied;
+                s.pages_dropped = st.pages_dropped;
+            }
+            return s;
+        };
+        auto better_regular = [&](const linux::CachedInode& a,
+                                  const linux::CachedInode& b) {
+            auto as = score_regular(a);
+            auto bs = score_regular(b);
+            if (as.pages_copied != bs.pages_copied) return as.pages_copied > bs.pages_copied;
+            if (as.bytes_nonzero != bs.bytes_nonzero) return as.bytes_nonzero > bs.bytes_nonzero;
+            if (as.bytes_copied != bs.bytes_copied) return as.bytes_copied > bs.bytes_copied;
+            if (as.pages_dropped != bs.pages_dropped) return as.pages_dropped < bs.pages_dropped;
+            if (as.sane_size != bs.sane_size) return as.sane_size;
+            if (as.non_pseudo != bs.non_pseudo) return as.non_pseudo;
+            return as.nr_cached > bs.nr_cached;
+        };
+        std::unordered_map<std::string, RegularCandidate> regular_candidates;
 
         std::size_t reg_count = 0, lnk_count = 0, dir_count = 0,
                     nopath = 0, pseudo_skipped = 0, untrusted_path = 0;
@@ -342,8 +407,12 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
                 by_ino_dir->add(std::make_shared<vfs::SizedLazyFileNode>(
                     fmt::format("{}-{}-{}.bin",
                         kind, ci.sb_fs.empty() ? "fs" : ci.sb_fs, ci.i_ino),
-                    [engp, ci]() { return linux::recover_file_size(*engp, ci); },
-                    [engp, ci]() { return linux::recover_file(*engp, ci); }));
+                    [engp, ci, recovered_file_bytes]() {
+                        return recovered_file_bytes(engp, ci).size();
+                    },
+                    [engp, ci, recovered_file_bytes]() {
+                        return recovered_file_bytes(engp, ci);
+                    }));
             }
 
             // /fs — the navigable global tree. Skip anonymous inodes.
@@ -379,25 +448,14 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
                 parent_dir->ensure_dir_child(basename);
                 ++dir_count;
             } else if (is_reg) {
-                // Don't add duplicates — if another inode resolved to the
-                // same path (bind mount), keep the first.
-                if (parent_dir->find(basename)) continue;
-                if (ci.i_size > 0 && ci.nr_cached == 0) {
-                    parent_dir->add(std::make_shared<vfs::SizedLazyFileNode>(
-                        basename,
-                        [ci, unavailable_file_bytes]() {
-                            return unavailable_file_bytes(ci).size();
-                        },
-                        [ci, unavailable_file_bytes]() {
-                            return unavailable_file_bytes(ci);
-                        }));
-                } else {
-                    parent_dir->add(std::make_shared<vfs::SizedLazyFileNode>(
-                        basename,
-                        [engp, ci]() { return linux::recover_file_size(*engp, ci); },
-                        [engp, ci]() { return linux::recover_file(*engp, ci); }));
+                // Keep one candidate per normalized path; duplicates are
+                // scored by recovered bytes before insertion into /fs.
+                auto found = regular_candidates.find(fs_path);
+                RegularCandidate cand{ci, dirname, basename};
+                if (found == regular_candidates.end() ||
+                    better_regular(ci, found->second.ci)) {
+                    regular_candidates[fs_path] = std::move(cand);
                 }
-                ++reg_count;
             } else if (is_lnk) {
                 if (parent_dir->find(basename)) continue;
                 auto target = linux::recover_symlink_target(*engp, ci);
@@ -423,6 +481,41 @@ std::unique_ptr<Engine> Engine::create(const Options& opts) {
                 ++lnk_count;
             }
         }
+        for (const auto& [fs_path, candidate] : regular_candidates) {
+            bool dir_ok = true;
+            auto parent_dir = candidate.dirname.empty()
+                ? fs_dir
+                : get_or_make_dir(fs_dir, candidate.dirname, dir_ok);
+            if (!dir_ok) {
+                ++nopath;
+                continue;
+            }
+            if (parent_dir->find(candidate.basename)) continue;
+
+            const auto ci = candidate.ci;
+            auto* engp = eng.get();
+            if (ci.i_size > 0 && ci.nr_cached == 0) {
+                parent_dir->add(std::make_shared<vfs::SizedLazyFileNode>(
+                    candidate.basename,
+                    [ci, unavailable_file_bytes]() {
+                        return unavailable_file_bytes(ci, nullptr).size();
+                    },
+                    [ci, unavailable_file_bytes]() {
+                        return unavailable_file_bytes(ci, nullptr);
+                    }));
+            } else {
+                parent_dir->add(std::make_shared<vfs::SizedLazyFileNode>(
+                    candidate.basename,
+                    [engp, ci, recovered_file_bytes]() {
+                        return recovered_file_bytes(engp, ci).size();
+                    },
+                    [engp, ci, recovered_file_bytes]() {
+                        return recovered_file_bytes(engp, ci);
+                    }));
+            }
+            ++reg_count;
+        }
+
         log::note("/fs: {} dirs, {} regular files, {} symlinks ({} inodes "
                   "skipped — no resolvable path, {} pseudo-fs skipped)",
                   dir_count, reg_count, lnk_count, nopath, pseudo_skipped);

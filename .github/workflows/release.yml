@@ -50,12 +50,15 @@ jobs:
 
       - name: Configure
         shell: pwsh
-        run: >
-          cmake -S . -B build/windows -G "Visual Studio 17 2022" -A x64
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=x64-windows
-          -DLMPFS_BUILD_TESTS=ON
-          -DLMPFS_BUILD_MOUNT_WINFSP=ON
+        run: |
+          # Stamp the package version from the release tag (v1.1 -> 1.1).
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          cmake -S . -B build/windows -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DLMPFS_BUILD_TESTS=ON `
+            -DLMPFS_BUILD_MOUNT_WINFSP=ON `
+            -DLMPFS_VERSION="$ver"
 
       - name: Build and test
         shell: pwsh
@@ -115,17 +118,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config rpm \
+            build-essential cmake ninja-build pkg-config \
             libfuse3-dev libsnappy-dev liblzma-dev nlohmann-json3-dev \
             libfmt-dev libyara-dev
 
       - name: Configure
-        run: >
-          cmake -S . -B build/linux -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DLMPFS_BUILD_TESTS=ON
-          -DLMPFS_BUILD_MOUNT_FUSE=ON
-          -DLMPFS_BUILD_MOUNT_WINFSP=OFF
+        run: |
+          ver="${GITHUB_REF_NAME#v}"   # v1.1 -> 1.1
+          cmake -S . -B build/linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLMPFS_BUILD_TESTS=ON \
+            -DLMPFS_BUILD_MOUNT_FUSE=ON \
+            -DLMPFS_BUILD_MOUNT_WINFSP=OFF \
+            -DLMPFS_VERSION="$ver"
 
       - name: Build and test
         run: |
@@ -138,8 +143,6 @@ jobs:
           mkdir -p dist
           cp build/linux/MemNixFS-*-Linux.tar.gz dist/
           cp build/linux/MemNixFS-*-Linux.zip dist/
-          cp build/linux/MemNixFS-*-Linux.deb dist/
-          cp build/linux/MemNixFS-*-Linux.rpm dist/ 2>/dev/null || true
 
       - name: Smoke packaged Linux artifacts
         run: |
@@ -148,10 +151,13 @@ jobs:
           rm -rf "$extract"
           mkdir -p "$extract"
           tar -xzf dist/MemNixFS-*-Linux.tar.gz -C "$extract"
-          exe="$(find "$extract" -path '*/bin/memnixfs' -type f | head -n 1)"
+          # Flat layout: the exe is at the package root with memnixfs.so beside
+          # it (RPATH $ORIGIN) — no bin/ or lib/ subdirs.
+          exe="$(find "$extract" -name memnixfs -type f | head -n 1)"
           test -n "$exe"
+          test -f "$(dirname "$exe")/memnixfs.so"
           ldd "$exe" | tee ldd.txt
-          grep -q 'memnixfs.so => .*/lib/memnixfs.so' ldd.txt
+          grep -q 'memnixfs.so' ldd.txt
           code=0
           "$exe" --help >help.txt 2>&1 || code=$?
           if [ "$code" != "0" ] && [ "$code" != "1" ]; then
@@ -160,14 +166,6 @@ jobs:
             exit "$code"
           fi
           grep -q 'mount <pt>' help.txt
-          sudo apt-get install -y ./dist/MemNixFS-*-Linux.deb
-          code=0
-          /usr/bin/memnixfs --help >/tmp/memnixfs-deb-help.txt 2>&1 || code=$?
-          if [ "$code" != "0" ] && [ "$code" != "1" ]; then
-            cat /tmp/memnixfs-deb-help.txt
-            exit "$code"
-          fi
-          grep -q 'mount <pt>' /tmp/memnixfs-deb-help.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.4.3

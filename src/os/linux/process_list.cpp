@@ -1,6 +1,8 @@
 #include "os/linux/process.h"
 #include "core/error.h"
 #include "core/log.h"
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <unordered_set>
 
@@ -12,6 +14,20 @@ struct Offsets {
     u64 pid, tgid, comm, tasks, parent, real_parent, mm, cred;
     u64 cred_uid, cred_gid;
 };
+
+constexpr u32 kLinuxPidMaxLimit = 4U * 1024U * 1024U;
+constexpr std::size_t kMaxTaskWalk = 1'000'000;
+
+bool plausible_pid(u32 pid) {
+    return pid > 0 && pid <= kLinuxPidMaxLimit;
+}
+
+bool plausible_comm(const std::string& comm) {
+    if (comm.empty() || comm.size() > 15) return false;
+    return std::all_of(comm.begin(), comm.end(), [](unsigned char c) {
+        return c >= 0x20 && c < 0x7f;
+    });
+}
 
 Offsets gather_offsets(const IsfSymbols& isf) {
     Offsets o{};
@@ -65,6 +81,8 @@ bool fill_process(const PhysicalLayer& phys, const KernelContext& k,
     if (!read_dm_u32(phys, k, task_va + o.pid,  out.pid))  return false;
     if (!read_dm_u32(phys, k, task_va + o.tgid, out.tgid)) return false;
     if (!read_dm_comm(phys, k, task_va + o.comm, out.comm)) return false;
+    if (!plausible_pid(out.pid) || !plausible_pid(out.tgid)) return false;
+    if (!plausible_comm(out.comm)) return false;
 
     // PPID: on this kernel build, real_parent / parent pointers appear to be
     // offset by 0x40 from the task_struct start (likely due to thread_info-in-
@@ -127,9 +145,17 @@ std::vector<Process> list_processes(const PhysicalLayer&     phys,
 
     VAddr cur = next;
     PAddr maxa = phys.max_address();
-    while (cur && !seen.count(cur)) {
+    while (cur && !seen.count(cur) && seen.size() < kMaxTaskWalk) {
+        if ((cur & 0x7ULL) != 0) {
+            log::debug("Stopping list walk: unaligned tasks link {:#x}", cur);
+            break;
+        }
         seen.insert(cur);
         VAddr task_va = cur - o.tasks;
+        if ((task_va & 0x7ULL) != 0) {
+            log::debug("Stopping list walk: unaligned task_struct {:#x}", task_va);
+            break;
+        }
 
         PAddr probe = 0;
         if (!dm_pa(task_va, kctx, maxa, probe)) {
@@ -140,7 +166,9 @@ std::vector<Process> list_processes(const PhysicalLayer&     phys,
 
         Process p{};
         if (fill_process(phys, kctx, task_va, o, p)) {
-            if (p.pid != 0 && !p.comm.empty()) out.push_back(p);
+            out.push_back(p);
+        } else {
+            log::debug("Skipping implausible task candidate at {:#x}", task_va);
         }
 
         u64 nxt = 0;
@@ -148,6 +176,8 @@ std::vector<Process> list_processes(const PhysicalLayer&     phys,
         if (nxt == next) break;
         cur = nxt;
     }
+    if (seen.size() >= kMaxTaskWalk)
+        log::warn("Stopped process list walk after {} entries; task list may be corrupt", seen.size());
     log::info("Listed {} processes", out.size());
     return out;
 }

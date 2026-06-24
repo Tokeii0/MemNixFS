@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+# Release version. Overridable so the release workflow can stamp the git tag:
+# it passes -DLMPFS_VERSION=<tag without 'v'> (e.g. tag v1.1 -> 1.1). Plain or
+# local builds default to the next planned release.
+set(LMPFS_VERSION "1.1.0" CACHE STRING "MemNixFS release/package version")
 project(MemNixFS
-    VERSION 0.37.1
+    VERSION ${LMPFS_VERSION}
     DESCRIPTION "Mount Linux memory dumps as a virtual filesystem"
     LANGUAGES CXX)
 
@@ -285,8 +289,9 @@ add_executable(memnixfs
     src/cli/main.cpp)
 target_link_libraries(memnixfs PRIVATE memnixfs_core memnixfs_dll)
 if(UNIX)
+    # Flat layout: the shared lib sits next to the executable, so look there.
     set_target_properties(memnixfs PROPERTIES
-        INSTALL_RPATH "$ORIGIN/../lib")
+        INSTALL_RPATH "$ORIGIN")
 endif()
 # Embed a manifest selecting the UTF-8 active code page so non-ASCII paths
 # (e.g. Chinese dump/symbol paths) round-trip correctly through argv,
@@ -410,18 +415,25 @@ if(LMPFS_BUILD_MOUNT_FUSE)
     target_link_libraries(memnixfs_core PUBLIC PkgConfig::FUSE)
 endif()
 
+# Flat "portable app folder" layout: the runnable executable and every shared
+# library it needs sit at the package root — no bin/ or lib/ subfolders, and the
+# main exe (memnixfs[.exe]) is always at the top level.
 install(TARGETS memnixfs memnixfs_dll
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
+    RUNTIME DESTINATION "."
+    LIBRARY DESTINATION ".")
 if(WIN32)
+    # Bundle the vcpkg runtime DLLs the linker deployed next to the built exe.
+    # Exclude the test-only sample plugin.
     install(DIRECTORY "$<TARGET_FILE_DIR:memnixfs>/"
-        DESTINATION bin
-        FILES_MATCHING PATTERN "*.dll")
+        DESTINATION "."
+        FILES_MATCHING
+            PATTERN "*.dll"
+            PATTERN "sample_plugin.dll" EXCLUDE)
 endif()
-install(FILES README.md vcpkg.json DESTINATION share/memnixfs)
-install(DIRECTORY docs DESTINATION share/memnixfs)
-install(DIRECTORY tools DESTINATION share/memnixfs OPTIONAL)
+# README/LICENSE at the root like a usual app. OPTIONAL so packaging never fails
+# just because a file isn't present (e.g. in the trimmed public-repo release).
+install(FILES README.md DESTINATION "." OPTIONAL)
+install(FILES LICENSE  DESTINATION "." OPTIONAL)
 
 set(CPACK_PACKAGE_NAME "MemNixFS")
 set(CPACK_PACKAGE_VENDOR "MemNixFS")
@@ -432,14 +444,9 @@ set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "MemNixFS")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL OFF)
-set(CPACK_GENERATOR "TGZ;ZIP")
-if(UNIX)
-    list(APPEND CPACK_GENERATOR "DEB")
-    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "MemNixFS maintainers")
-    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-    find_program(LMPFS_RPMBUILD_EXECUTABLE rpmbuild)
-    if(LMPFS_RPMBUILD_EXECUTABLE)
-        list(APPEND CPACK_GENERATOR "RPM")
-    endif()
-endif()
+# Portable archives only — a flat, extract-and-run folder on both platforms.
+# (FHS system packages like .deb/.rpm require a bin/lib split, the opposite of
+# the flat layout above; re-add them behind their own component config if an
+# apt/dnf-installable package is ever needed.)
+set(CPACK_GENERATOR "ZIP;TGZ")
 include(CPack)

@@ -997,6 +997,32 @@ std::vector<CachedInode> enumerate_cached_inodes(const Engine& eng) {
 
     log::debug("pagecache: {} super_blocks, {} cached inodes",
               sb_count, out.size());
+
+    // On dumps where the DTB didn't validate, reads of kernel-image globals
+    // (super_blocks itself) can come back empty/garbage even though the
+    // kmalloc'd objects are perfectly readable via the direct map. When that
+    // leaves us with nothing, fall back to the symbol-free path (fd tables +
+    // dcache tree) — it relies only on direct-map reads, so it works whenever
+    // the process list does. (Previously this path was reached only when the
+    // `super_blocks` symbol was absent, so a present-but-unreadable symbol gave
+    // an empty /fs.)
+    if (out.empty()) {
+        log::warn("pagecache: super_blocks walk yielded 0 inodes; falling back "
+                  "to symbol-free enumeration (fd tables + dcache tree)");
+        std::unordered_set<VAddr> fs_roots;
+        auto from_fds  = walk_fdtables_for_inodes(eng, &fs_roots);
+        for (const auto& m : enumerate_mounts(eng))
+            if (m.mnt_root != 0) fs_roots.insert(m.mnt_root);
+        auto from_tree = walk_dentry_tree_for_inodes(eng, fs_roots);
+        std::unordered_set<VAddr> uniq;
+        uniq.reserve(from_tree.size() + from_fds.size());
+        for (VAddr ino : from_tree) if (uniq.insert(ino).second) materialise(ino, sb_fs_cache);
+        const std::size_t n_tree = out.size();
+        for (VAddr ino : from_fds)  if (uniq.insert(ino).second) materialise(ino, sb_fs_cache);
+        log::debug("pagecache: {} inodes via symbol-free fallback "
+                  "({} from dcache tree + {} unique from fd tables)",
+                  out.size(), n_tree, out.size() - n_tree);
+    }
     return out;
 }
 
@@ -1151,11 +1177,7 @@ RecoveredFile recover_file_internal(const Engine& eng, const CachedInode& ci,
     auto pages = collect_cached_pages(eng, o, ci.inode_va);
     rf.stats.xarray_pages_seen = pages.size();
     std::unordered_set<u64> seen_indices;
-    std::unordered_set<u64> copied_indices;
-    std::unordered_set<u64> dropped_indices;
     seen_indices.reserve(pages.size());
-    copied_indices.reserve(pages.size());
-    dropped_indices.reserve(pages.size());
     for (const auto& p : pages) {
         if (p.index < rf.stats.expected_pages)
             seen_indices.insert(p.index);
@@ -1163,29 +1185,143 @@ RecoveredFile recover_file_internal(const Engine& eng, const CachedInode& ci,
     rf.stats.pages_within_size = seen_indices.size();
 
     // 2. Get vmemmap_base — needed to turn a folio (struct page) VA into a PFN.
-    u64 vmemmap_base = read_kernel_u64_var(eng, "vmemmap_base");
-    if (vmemmap_base == 0 && !pages.empty()) {
-        // Symbol-free derivation (BTF-only ISFs have no `vmemmap_base`).
-        // The vmemmap region base is 1 GiB-aligned on x86_64
-        // (CONFIG_RANDOMIZE_MEMORY randomizes at PUD granularity), and a
-        // struct page for PFN p lives at vmemmap_base + p*sizeof(page). For
-        // RAM < 64 GiB every PFN satisfies p*64 < 1 GiB, so every cached
-        // folio VA falls in the first 1 GiB of the vmemmap region — and the
-        // smallest folio VA rounded down to 1 GiB recovers the base exactly.
-        // (Verified: 0xfffff82b41e5b640 & ~0x3fffffff == real 0xfffff82b40000000.)
-        // A wrong guess only yields out-of-range PAs that get dropped to
-        // zeros below — never garbage content.
+    //
+    // The symbol read goes through kernel-VA translation, which is WRONG when
+    // the DTB is unvalidated (degraded mode): it returns a nonzero-but-bogus
+    // value that makes every PFN out-of-range, silently dropping all pages to
+    // zero. So we cross-check it against a value derived straight from the
+    // cached folios — a computation that touches only direct-map reads and is
+    // therefore correct regardless of the DTB — and prefer the derived value
+    // whenever it disagrees (not only when the symbol is missing).
+    //
+    // The vmemmap region base is 1 GiB-aligned on x86_64 (CONFIG_RANDOMIZE_MEMORY
+    // randomizes at PUD granularity), and a struct page for PFN p lives at
+    // vmemmap_base + p*sizeof(page). For RAM < 64 GiB every PFN satisfies
+    // p*64 < 1 GiB, so every cached folio VA falls in the first 1 GiB of the
+    // region — and the smallest folio VA rounded down to 1 GiB recovers the base
+    // EXACTLY. (Verified: 0xfffff82b41e5b640 & ~0x3fffffff == 0xfffff82b40000000.)
+    u64 symbol_base = read_kernel_u64_var(eng, "vmemmap_base");
+    u64 derived_base = 0;
+    rf.stats.vmemmap_symbol_base = symbol_base;
+    if (!pages.empty()) {
         u64 min_folio = ~0ull;
         for (const auto& p : pages)
             if (p.folio_va && p.folio_va < min_folio) min_folio = p.folio_va;
-        if (min_folio != ~0ull) {
+        // Derive only where it is provably exact (RAM < 64 GiB) or where there
+        // is no symbol to fall back on. For RAM >= 64 GiB with a symbol present
+        // we keep the symbol value, since a lone folio could legitimately sit in
+        // a later 1 GiB band and the rounding would be off.
+        const bool ram_under_64g = eng.phys().max_address() < (64ull << 30);
+        if (min_folio != ~0ull && (symbol_base == 0 || ram_under_64g)) {
             constexpr u64 k1GiB = 0x40000000ull;
-            vmemmap_base = min_folio & ~(k1GiB - 1);
-            log::debug("recover_file: derived vmemmap_base={:#x} symbol-free "
-                       "(min folio {:#x}) for '{}'", vmemmap_base, min_folio,
-                       ci.path);
+            derived_base = min_folio & ~(k1GiB - 1);
         }
     }
+    rf.stats.vmemmap_derived_base = derived_base;
+
+    struct CopyAttempt {
+        u64 base = 0;
+        const char* source = "none";
+        std::unordered_set<u64> copied_indices;
+        std::unordered_set<u64> dropped_indices;
+        u64 bytes_copied = 0;
+        u64 bytes_nonzero = 0;
+    };
+
+    auto count_nonzero = [](const u8* data, u64 len) -> u64 {
+        u64 n = 0;
+        for (u64 i = 0; i < len; ++i)
+            if (data[i] != 0) ++n;
+        return n;
+    };
+
+    auto attempt_copy = [&](u64 base, const char* source, bool write_bytes) {
+        CopyAttempt attempt;
+        attempt.base = base;
+        attempt.source = source;
+        attempt.copied_indices.reserve(pages.size());
+        attempt.dropped_indices.reserve(pages.size());
+        if (base == 0) {
+            for (u64 idx : seen_indices)
+                attempt.dropped_indices.insert(idx);
+            return attempt;
+        }
+
+        for (const auto& p : pages) {
+            if (p.index >= rf.stats.expected_pages) continue;
+            if (p.folio_va < base) {
+                attempt.dropped_indices.insert(p.index);
+                continue;
+            }
+            u64 pfn = (p.folio_va - base) / kStructPageSz;
+            PAddr pa = static_cast<PAddr>(pfn) << kPageShift;
+            if (pa >= eng.phys().max_address()) {
+                attempt.dropped_indices.insert(p.index);
+                continue;
+            }
+
+            u64 off_in_file = p.index * kPageSize;
+            if (off_in_file >= final_size) continue;
+            u64 chunk = std::min<u64>(kPageSize, final_size - off_in_file);
+            std::array<u8, kPageSize> scratch{};
+            if (eng.phys().read(pa, scratch.data(), chunk) == chunk) {
+                attempt.copied_indices.insert(p.index);
+                attempt.bytes_copied += chunk;
+                attempt.bytes_nonzero += count_nonzero(scratch.data(), chunk);
+                if (write_bytes && materialize_bytes)
+                    std::memcpy(rf.bytes.data() + off_in_file, scratch.data(), chunk);
+            } else {
+                attempt.dropped_indices.insert(p.index);
+            }
+        }
+        return attempt;
+    };
+
+    auto better_attempt = [](const CopyAttempt& a, const CopyAttempt& b) {
+        if (a.copied_indices.size() != b.copied_indices.size())
+            return a.copied_indices.size() > b.copied_indices.size();
+        if (a.bytes_copied != b.bytes_copied)
+            return a.bytes_copied > b.bytes_copied;
+        if (a.bytes_nonzero != b.bytes_nonzero)
+            return a.bytes_nonzero > b.bytes_nonzero;
+        if (a.dropped_indices.size() != b.dropped_indices.size())
+            return a.dropped_indices.size() < b.dropped_indices.size();
+        return a.base != 0 && b.base == 0;
+    };
+
+    std::vector<std::pair<u64, const char*>> bases;
+    auto add_base = [&](u64 base, const char* source) {
+        if (base == 0) return;
+        for (const auto& b : bases)
+            if (b.first == base) return;
+        bases.emplace_back(base, source);
+    };
+    add_base(symbol_base, "symbol");
+    add_base(derived_base, "folio-derived");
+
+    CopyAttempt chosen;
+    bool have_attempt = false;
+    if (check_physical) {
+        for (const auto& b : bases) {
+            auto attempt = attempt_copy(b.first, b.second, false);
+            if (!have_attempt || better_attempt(attempt, chosen)) {
+                chosen = std::move(attempt);
+                have_attempt = true;
+            }
+        }
+    }
+    u64 vmemmap_base = have_attempt ? chosen.base : 0;
+    rf.stats.vmemmap_base = vmemmap_base;
+    if (check_physical && symbol_base != 0 && vmemmap_base != 0 &&
+        vmemmap_base != symbol_base) {
+        log::debug("recover_file: vmemmap_base symbol={:#x} lost to {} "
+                   "{:#x} for '{}' (copied={} dropped={} nonzero={})",
+                   symbol_base, chosen.source, vmemmap_base, ci.path,
+                   chosen.copied_indices.size(), chosen.dropped_indices.size(),
+                   chosen.bytes_nonzero);
+    }
+    std::unordered_set<u64>& copied_indices = chosen.copied_indices;
+    std::unordered_set<u64>& dropped_indices = chosen.dropped_indices;
     if (check_physical && vmemmap_base == 0) {
         log::debug("recover_file: no vmemmap_base and no folios — '{}' is zeros",
                    ci.path);
@@ -1232,6 +1368,7 @@ RecoveredFile recover_file_internal(const Engine& eng, const CachedInode& ci,
         if (eng.phys().read(pa, dst, chunk) == chunk) {
             copied_indices.insert(p.index);
             rf.stats.bytes_copied += chunk;
+            rf.stats.bytes_nonzero += count_nonzero(dst, chunk);
         } else {
             dropped_indices.insert(p.index);
         }
@@ -1348,6 +1485,8 @@ std::string describe_recovered_file_state(const RecoveredFileStats& st) {
         return "unavailable: zero-length recovered file";
     if (st.xarray_pages_seen == 0)
         return "unavailable: inode metadata recovered, but no cached content pages";
+    if (st.physical_reads_checked && st.pages_copied == 0)
+        return "unavailable: cached folios were found, but no physical file bytes were readable";
     if (st.missing_ranges_total != 0 && st.dropped_ranges_total != 0)
         return "partial: missing cached pages and unreadable physical pages";
     if (st.missing_ranges_total != 0)
@@ -1372,11 +1511,10 @@ ByteBuf format_pagecache_recovery(const Engine& eng) {
     std::string out;
     out.reserve(256 * 1024);
     out += "# /sys/pagecache/recovery.txt - recovered-file coverage\n";
-    out += "# Fast catalog: uses inode.i_size and address_space.nrpages only.\n";
-    out += "# Exact page offsets and physical dropped-page checks are performed by actual file recovery and log/journal consumers.\n";
-    out += "# Zero-filled gaps in recovered files are synthetic unless an exact consumer reports checked.\n";
-    out += "# state fs ino size expected cached path\n";
-    out += "#-----+--+---+----+--------+------+----\n";
+    out += "# Exact catalog: validates cached folios against physical memory without materialising file buffers.\n";
+    out += "# Zero-filled gaps are synthetic unless copied_pages covers the whole logical file.\n";
+    out += "# state fs ino size expected cached seen copied nonzero_bytes dropped missing vmemmap path\n";
+    out += "#-----+--+---+----+--------+------+----+------+-------+-------------+-------+-------+-------+----\n";
     if (inodes.empty()) {
         out += "unavailable: no cached inodes recovered\n";
         return ByteBuf(out.begin(), out.end());
@@ -1384,24 +1522,32 @@ ByteBuf format_pagecache_recovery(const Engine& eng) {
 
     for (const auto& ci : inodes) {
         if (ci.nr_cached == 0 && ci.i_size == 0) continue;
-        const u64 expected = ci.i_size == 0 ? 0 : ((ci.i_size + kPageSize - 1) / kPageSize);
-        std::string state;
+        RecoveredFileStats st{};
         if (ci.i_size == 0) {
-            state = "unavailable: zero-length inode size; exact xarray walk required for pseudo-file size";
+            st.logical_size = 0;
+            st.expected_pages = 0;
         } else if (ci.nr_cached == 0) {
-            state = "unavailable: inode metadata recovered, but no cached content pages";
-        } else if (ci.nr_cached < expected) {
-            state = "partial: cached-page count is below logical file size; sparse zero-filled gaps are synthetic";
+            st.logical_size = ci.i_size;
+            st.expected_pages = (ci.i_size + kPageSize - 1) / kPageSize;
         } else {
-            state = "partial: cached-page count covers logical size; exact offsets and physical readability not checked in catalog";
+            st = recover_file_stats(eng, ci, true);
         }
-        out += fmt::format("{:<108} {:<8} {:>10} {:>12} {:>8} {:>6} {}\n",
+        const std::string state = ci.i_size == 0
+            ? "unavailable: zero-length inode size; exact xarray walk required for pseudo-file size"
+            : describe_recovered_file_state(st);
+        out += fmt::format("{:<92} {:<8} {:>10} {:>12} {:>8} {:>6} {:>6} {:>7} {:>13} {:>7} {:>7} {:#x} {}\n",
                            state,
                            ci.sb_fs.empty() ? "?" : ci.sb_fs,
                            ci.i_ino,
                            ci.i_size,
-                           expected,
+                           st.expected_pages,
                            ci.nr_cached,
+                           st.pages_within_size,
+                           st.pages_copied,
+                           st.bytes_nonzero,
+                           st.pages_dropped,
+                           st.missing_ranges_total,
+                           st.vmemmap_base,
                            ci.path.empty() ? "(anon)" : ci.path);
     }
     return ByteBuf(out.begin(), out.end());

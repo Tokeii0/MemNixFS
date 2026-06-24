@@ -3,6 +3,7 @@
 #include "symbols/isf_symbols.h"
 #include "core/error.h"
 #include "core/log.h"
+#include <algorithm>
 #include <fstream>
 #include <cstdio>
 #include <iomanip>
@@ -193,17 +194,55 @@ winhttp_get(const std::string& url, std::vector<uint8_t>& body) {
     return { status, err };
 }
 #else
-// Non-Windows: shell out to curl/wget. Same return contract.
+std::string shell_quote(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else           out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+}
+
+// Non-Windows: use curl, but ask it for the real HTTP status and suppress its
+// own stderr so a mirror miss does not surface as a misleading user-visible
+// "curl: (22) ... 404" error. Same return contract as the WinHTTP path.
 std::pair<int, std::string>
 winhttp_get(const std::string& url, std::vector<uint8_t>& body) {
-    std::string cmd = "curl -fsSL --max-time 30 -o /dev/stdout " + url;
+    constexpr const char* marker = "\nLMPFS_HTTP_STATUS:";
+    std::string cmd = "curl -sS -L --max-time 30 --output - --write-out "
+                      + shell_quote(std::string(marker) + "%{http_code}\\n")
+                      + " " + shell_quote(url) + " 2>/dev/null";
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) return { -1, "popen failed" };
     char buf[8192]; std::size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0)
         body.insert(body.end(), buf, buf + n);
     int rc = pclose(p);
-    return { rc == 0 ? 200 : 404, rc == 0 ? "" : "curl failed" };
+
+    const std::string needle = marker;
+    auto it = std::find_end(body.begin(), body.end(), needle.begin(), needle.end());
+    if (it == body.end()) {
+        body.clear();
+        return { -2, rc == 0 ? "curl returned no HTTP status" : "curl failed before HTTP response" };
+    }
+    std::string code_text(it + needle.size(), body.end());
+    body.erase(it, body.end());
+    while (!code_text.empty() && (code_text.back() == '\n' || code_text.back() == '\r'))
+        code_text.pop_back();
+    int status = 0;
+    try {
+        status = std::stoi(code_text);
+    } catch (...) {
+        status = -3;
+    }
+    if (status < 100 || status > 599) {
+        body.clear();
+        return { -3, "curl returned invalid HTTP status" };
+    }
+    return { status, rc == 0 ? "" : "curl transport failure" };
 }
 #endif
 
