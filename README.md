@@ -91,6 +91,11 @@ $ memnixfs --dump memory.lime cat /sys/findevil/findevil.txt   # read one file, 
 $ memnixfs --dump memory.lime export ./out         # or export everything to a folder
 ```
 
+> **Windows — the `mount` command requires [WinFsp](https://winfsp.dev/rel/).** It is a
+> kernel-mode filesystem driver, so it cannot be bundled in the download; install it once
+> (default `.msi` options are fine) and `mount` works. Prefer not to install anything? Use
+> `cat` to read a single file or `export` to copy files out to a folder — neither needs WinFsp.
+
 A normal run is quiet — a few status lines (and how long the load took), then your
 output. Add `-v` / `--verbose` to see the full diagnostic pipeline (symbol resolution,
 page-table and DTB scans, warnings), or `-q` for critical errors only.
